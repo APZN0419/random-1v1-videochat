@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>테스트124</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 16px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    video { width: 360px; max-width: 100%; background:#111; border-radius: 12px; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd; cursor:pointer; }
+    button:disabled { opacity: 0.5; cursor:not-allowed; }
+    .box { padding: 12px; border: 1px solid #eee; border-radius: 12px; margin-top: 12px; }
+    input { padding: 10px; border-radius: 10px; border: 1px solid #ddd; width: 240px; }
+    .muted { color:#666; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>1:1 랜덤 화상채팅 (MVP)</h1>
+  <p class="muted">카메라가 없어도 동작: 먼저 (비디오+오디오) 시도 → 실패하면 (오디오만)으로 자동 전환</p>
+
+  <div class="row">
+    <div>
+      <h3>내 화면</h3>
+      <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+    <div>
+      <h3>상대 화면</h3>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <div class="box">
+    <div class="row">
+      <button id="btnStart">카메라/마이크 켜기</button>
+      <button id="btnJoin" disabled>랜덤 매칭 시작</button>
+      <button id="btnNext" disabled>다음 상대</button>
+      <button id="btnHangup" disabled>연결 끊기</button>
+    </div>
+
+    <div style="margin-top:10px" class="row">
+      <input id="reportReason" placeholder="신고 사유(예: 노출/욕설)" />
+      <button id="btnReport" disabled>신고</button>
+    </div>
+
+    <p id="status" class="muted">상태: idle</p>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+    const btnStart = document.getElementById("btnStart");
+    const btnJoin = document.getElementById("btnJoin");
+    const btnNext = document.getElementById("btnNext");
+    const btnHangup = document.getElementById("btnHangup");
+    const btnReport = document.getElementById("btnReport");
+    const reportReason = document.getElementById("reportReason");
+    const statusEl = document.getElementById("status");
+
+    let localStream = null;
+    let pc = null;
+    let roomId = null;
+    let role = null;
+
+    const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+    function setStatus(text) { statusEl.textContent = `상태: ${text}`; }
+
+    function cleanupPeer() {
+      if (pc) { pc.close(); pc = null; }
+      remoteVideo.srcObject = null;
+      roomId = null;
+      role = null;
+      btnNext.disabled = true;
+      btnHangup.disabled = true;
+      btnReport.disabled = true;
+    }
+
+    async function ensureMedia() {
+      if (localStream) return localStream;
+
+      try {
+        // 1) 카메라+마이크 먼저 시도
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      } catch (e) {
+        // 2) 카메라 없으면 오디오만
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+
+      // 카메라가 있으면 내 화면 표시, 없으면 비워둠
+      if (localStream.getVideoTracks().length > 0) {
+        localVideo.srcObject = localStream;
+      } else {
+        localVideo.srcObject = null;
+      }
+
+      return localStream;
+    }
+
+    function createPeerConnection() {
+      pc = new RTCPeerConnection(rtcConfig);
+
+      // 내 트랙 추가(마이크만 있으면 오디오만 추가됨)
+      for (const track of localStream.getTracks()) {
+        pc.addTrack(track, localStream);
+      }
+
+      // 내가 카메라 없어도 "상대 영상"을 받을 수 있게 recvonly 비디오 추가
+      if (!localStream.getVideoTracks().length) {
+        pc.addTransceiver("video", { direction: "recvonly" });
+      }
+
+      pc.ontrack = (event) => {
+        remoteVideo.srcObject = event.streams[0];
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate && roomId) {
+          socket.emit("room:signal", { roomId, data: { type: "ice", candidate: event.candidate } });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        setStatus(`connected=${pc.connectionState}`);
+      };
+    }
+
+    // 버튼
+    btnStart.onclick = async () => {
+      try {
+        setStatus("requesting_media");
+        await ensureMedia();
+
+        if (localStream && localStream.getAudioTracks().length > 0) {
+          if (localStream.getVideoTracks().length > 0) setStatus("media_ready");
+          else setStatus("audio_ready (no camera)");
+
+          btnJoin.disabled = false; // ⭐ 핵심: 카메라 없어도 매칭 버튼 활성화
+        } else {
+          setStatus("no_audio_device");
+          alert("마이크가 감지되지 않아. 마이크 연결/설정을 확인해줘.");
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus("media_denied");
+        alert("마이크 권한이 필요해. 크롬 사이트 설정에서 마이크 허용 확인!");
+      }
+    };
+
+    btnJoin.onclick = () => {
+      cleanupPeer();
+      setStatus("queue_join");
+      socket.emit("queue:join");
+      btnJoin.disabled = true;
+    };
+
+    btnNext.onclick = () => {
+      if (!roomId) return;
+      setStatus("next_requested");
+      socket.emit("room:next", { roomId });
+      cleanupPeer();
+    };
+
+    btnHangup.onclick = () => {
+      cleanupPeer();
+      btnJoin.disabled = false;
+      setStatus("hung_up");
+    };
+
+    btnReport.onclick = () => {
+      if (!roomId) return;
+      socket.emit("room:report", { roomId, reason: reportReason.value || "no_reason" });
+    };
+
+    // 소켓 이벤트
+    socket.on("queue:status", ({ status }) => setStatus(status));
+
+    socket.on("match:found", async ({ roomId: rid, role: r }) => {
+      try {
+        roomId = rid;
+        role = r;
+
+        setStatus(`match_found (${role})`);
+        btnNext.disabled = false;
+        btnHangup.disabled = false;
+        btnReport.disabled = false;
+
+        await ensureMedia();
+        createPeerConnection();
+
+        if (role === "caller") {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit("room:signal", { roomId, data: { type: "offer", sdp: offer.sdp } });
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus("match_error");
+        cleanupPeer();
+        btnJoin.disabled = false;
+      }
+    });
+
+    socket.on("room:signal", async ({ data }) => {
+      if (!pc) return;
+
+      if (data.type === "offer") {
+        await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("room:signal", { roomId, data: { type: "answer", sdp: answer.sdp } });
+      }
+
+      if (data.type === "answer") {
+        await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+      }
+
+      if (data.type === "ice") {
+        try { await pc.addIceCandidate(data.candidate); } catch (e) {}
+      }
+    });
+
+    socket.on("room:ended", ({ reason }) => {
+      setStatus(`room_ended (${reason})`);
+      cleanupPeer();
+      btnJoin.disabled = true;
+    });
+
+    socket.on("report:ok", () => alert("신고 접수됨(테스트: 서버 콘솔 확인)"));
+  </script>
+</body>
+</html>

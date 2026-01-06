@@ -1,0 +1,9 @@
+{
+  "name": "random-1v1-videochat",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
